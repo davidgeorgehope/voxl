@@ -13,6 +13,73 @@ mod ffi {
 use std::ffi::CString;
 use std::ptr;
 
+/// Which H.264 encoder to use: "x264" (CPU) or, on macOS, "videotoolbox" (hardware,
+/// the default there; falls back to x264 if the session can't be created).
+static BACKEND: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn set_backend(name: &str) {
+    let _ = BACKEND.set(name.to_string());
+}
+
+fn backend() -> &'static str {
+    BACKEND
+        .get()
+        .map(|s| s.as_str())
+        .unwrap_or(if cfg!(target_os = "macos") { "videotoolbox" } else { "x264" })
+}
+
+pub enum Encoder {
+    X264(X264),
+    #[cfg(target_os = "macos")]
+    Vt(crate::vtenc::Vt),
+}
+
+impl Encoder {
+    pub fn new(cfg: &EncoderConfig) -> Result<Self, String> {
+        #[cfg(target_os = "macos")]
+        if matches!(backend(), "videotoolbox" | "vt") {
+            match crate::vtenc::Vt::new(cfg) {
+                Ok(v) => return Ok(Encoder::Vt(v)),
+                Err(e) => log::warn!("{e}; falling back to x264"),
+            }
+        }
+        let _ = backend();
+        X264::new(cfg).map(Encoder::X264)
+    }
+
+    pub fn set_rate(&mut self, crf: f32, max_kbps: u32) {
+        match self {
+            Encoder::X264(e) => e.set_rate(crf, max_kbps),
+            #[cfg(target_os = "macos")]
+            Encoder::Vt(e) => e.set_rate(crf, max_kbps),
+        }
+    }
+
+    pub fn set_rate_buf(&mut self, crf: f32, max_kbps: u32, buf_kbit: u32) {
+        match self {
+            Encoder::X264(e) => e.set_rate_buf(crf, max_kbps, buf_kbit),
+            #[cfg(target_os = "macos")]
+            Encoder::Vt(e) => e.set_rate_buf(crf, max_kbps, buf_kbit),
+        }
+    }
+
+    pub fn encode(
+        &mut self,
+        p: &Planes,
+        ts_ms: i64,
+        force_idr: bool,
+        qp: Option<i32>,
+        mb_info: Option<&mut [u8]>,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, String> {
+        match self {
+            Encoder::X264(e) => e.encode(p, ts_ms, force_idr, qp, mb_info, out),
+            #[cfg(target_os = "macos")]
+            Encoder::Vt(e) => e.encode(p, ts_ms, force_idr, out),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct EncoderConfig {
     pub width: u32,
@@ -25,7 +92,7 @@ pub struct EncoderConfig {
     pub max_kbps: u32,
 }
 
-pub struct Encoder {
+pub struct X264 {
     h: *mut ffi::x264_t,
     param: ffi::x264_param_t,
     pic: ffi::x264_picture_t,
@@ -34,7 +101,7 @@ pub struct Encoder {
     pub height: u32,
 }
 
-unsafe impl Send for Encoder {}
+unsafe impl Send for X264 {}
 
 pub struct Planes<'a> {
     pub y: &'a [u8],
@@ -44,7 +111,7 @@ pub struct Planes<'a> {
     pub stride_uv: usize,
 }
 
-impl Encoder {
+impl X264 {
     pub fn new(cfg: &EncoderConfig) -> Result<Self, String> {
         unsafe {
             let mut param: ffi::x264_param_t = std::mem::zeroed();
@@ -114,7 +181,7 @@ impl Encoder {
             ffi::x264_picture_init(&mut pic);
             pic.img.i_csp = ffi::X264_CSP_I420 as i32;
             pic.img.i_plane = 3;
-            Ok(Encoder {
+            Ok(X264 {
                 h,
                 param,
                 pic,
@@ -204,7 +271,7 @@ impl Encoder {
     }
 }
 
-impl Drop for Encoder {
+impl Drop for X264 {
     fn drop(&mut self) {
         unsafe { ffi::x264_encoder_close(self.h) }
     }
@@ -218,6 +285,10 @@ mod bench {
     #[test]
     #[ignore]
     fn encode_cost() {
+        // ENC=x264 or ENC=videotoolbox (macOS) picks the encoder.
+        if let Ok(b) = std::env::var("ENC") {
+            set_backend(&b);
+        }
         let (w, h) = (2560usize, 1600usize);
         let mbs = (w / 16) * (h / 16);
         let threads: u32 = std::env::var("T")
@@ -282,6 +353,10 @@ mod bench {
                     &mut out,
                 )
                 .unwrap();
+                if f == 0 {
+                    assert_eq!(&out[..4], &[0, 0, 0, 1], "Annex-B start code");
+                    assert_eq!(out[4] & 0x1f, 7, "keyframe starts with an SPS");
+                }
                 if f >= 20 {
                     total += t.elapsed();
                     cpu_ms += cpu() - c0;

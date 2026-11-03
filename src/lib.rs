@@ -15,6 +15,8 @@ mod corners;
 #[cfg(target_os = "linux")]
 mod desktop;
 mod encoder;
+#[cfg(target_os = "macos")]
+mod vtenc;
 mod files;
 mod help;
 mod hub;
@@ -141,6 +143,9 @@ async fn serve(a: HashMap<String, String>) {
     let ncpu = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4) as u32;
+    if let Some(e) = a.get("encoder") {
+        encoder::set_backend(e);
+    }
     let vcfg = video::VideoConfig {
         display: display.clone(),
         fps: range_max(a.get("framerate"), 60.0) as u32,

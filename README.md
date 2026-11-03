@@ -221,6 +221,8 @@ apps that should hear you.
 | ---------------------- | --------------------------- | -------------------------------------------------------------------------------------- |
 | `--display`            | main display                | display to stream: an index (0 is the main display) or a display ID; logged at startup |
 | `--capture-scale`      | native, within the budget   | streamed pixels per point                                                              |
+| `--output-size`        | none                        | stream at most WxH pixels (e.g. `1366x768`) by picking the capture scale                |
+| `--encoder`            | `videotoolbox`              | H.264 encoder: `videotoolbox` (hardware; falls back to x264) or `x264`                 |
 | `--max-capture-pixels` | `4096000` (2560x1600)       | pixel budget for the automatic scale: x264's cost grows with area                      |
 | `--microphone-device`  | first loopback device found | output device (name or prefix) to play the browser microphone into                     |
 | `--resize-scale`       | the capture scale           | so a viewer's window maps to the same number of points on the Mac                      |

@@ -68,6 +68,9 @@ Desktop (this Mac's screen):
                                 display) or a display ID
   --capture-scale               streamed pixels per point (default: native,
                                 within the budget)
+  --output-size                 stream at most WxH pixels, e.g. 1366x768 (sets
+                                the capture scale)
+  --encoder                     videotoolbox (hardware, default) or x264
   --max-capture-pixels          pixel budget for the automatic scale
                                 (default 4096000)
   --enable-clipboard            true, in, out or false (default true)

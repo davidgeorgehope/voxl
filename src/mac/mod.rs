@@ -67,6 +67,17 @@ pub fn init(a: &HashMap<String, String>) {
             .get("capture-scale")
             .and_then(|v| v.parse().ok())
             .filter(|&v: &f64| v > 0.0);
+        // --output-size=1366x768: the scale that fits the display in that many pixels.
+        if let Some((w, h)) = a.get("output-size").and_then(|v| {
+            let (w, h) = v.split_once(['x', 'X'])?;
+            Some((w.trim().parse::<f64>().ok()?, h.trim().parse::<f64>().ok()?))
+        }) {
+            let b = unsafe { CGDisplayBounds(display) };
+            let k = (w / b.size.width.max(1.0)).min(h / b.size.height.max(1.0));
+            if k > 0.0 {
+                s.scale = Some(k);
+            }
+        }
         if let Some(px) = a.get("max-capture-pixels").and_then(|v| v.parse().ok()) {
             s.max_pixels = px;
         }
