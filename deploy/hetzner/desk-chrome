@@ -1,0 +1,14 @@
+#!/bin/sh
+# Google Chrome for the headless XFCE session on Xvfb :1 (no GPU).
+exec /usr/bin/google-chrome-stable \
+  --disable-gpu \
+  --disable-gpu-compositing \
+  --disable-features=VaapiVideoDecoder,VaapiVideoEncoder \
+  --use-gl=angle \
+  --use-angle=swiftshader \
+  --ozone-platform=x11 \
+  --no-first-run \
+  --no-default-browser-check \
+  --disable-dev-shm-usage \
+  --password-store=basic \
+  "$@"

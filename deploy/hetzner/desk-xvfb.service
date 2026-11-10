@@ -1,0 +1,15 @@
+[Unit]
+Description=Xvfb display :1 for the desk session
+After=network.target
+
+[Service]
+Type=simple
+Slice=desk.slice
+User=desk
+Group=desk
+ExecStart=/usr/bin/Xvfb :1 -screen 0 1366x768x24 -shmem -nolisten tcp -noreset +extension RANDR +extension MIT-SHM +extension DAMAGE +extension XFIXES +extension XTEST +extension COMPOSITE
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

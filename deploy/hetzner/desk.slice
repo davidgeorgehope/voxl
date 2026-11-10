@@ -1,0 +1,6 @@
+[Unit]
+Description=Memory-capped slice for the Hetzner voxl desktop
+[Slice]
+MemoryMax=3G
+MemoryAccounting=yes
+CPUAccounting=yes

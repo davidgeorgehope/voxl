@@ -1,0 +1,29 @@
+[Unit]
+Description=XFCE session on Xvfb :1
+After=desk-xvfb.service
+Requires=desk-xvfb.service
+
+[Service]
+Type=simple
+Slice=desk.slice
+User=desk
+Group=desk
+Environment=HOME=/home/desk
+Environment=USER=desk
+Environment=LOGNAME=desk
+Environment=DISPLAY=:1
+Environment=XDG_RUNTIME_DIR=/run/desk
+Environment=XDG_CONFIG_HOME=/home/desk/.config
+Environment=XDG_CACHE_HOME=/home/desk/.cache
+Environment=XDG_DATA_HOME=/home/desk/.local/share
+Environment=LANG=C.UTF-8
+Environment=GTK_THEME=Adwaita
+RuntimeDirectory=desk
+RuntimeDirectoryMode=0700
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 50); do [ -S /tmp/.X11-unix/X1 ] && exit 0; sleep 0.1; done; echo "Xvfb :1 did not appear"; exit 1'
+ExecStart=/usr/bin/dbus-run-session -- /usr/bin/startxfce4
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
