@@ -27,6 +27,8 @@ pub struct VideoConfig {
     pub coalesce: Duration,
     pub stripes: u32,
     pub adaptive_threads: bool,
+    /// Offer HEVC (and HEVC 4:4:4) to clients that ask, when the hardware encodes it.
+    pub hevc: bool,
 }
 
 struct Job {
@@ -42,6 +44,11 @@ struct Job {
     mb_dirty: Option<Arc<Vec<u8>>>,
     captured_at: Instant,
     marker_ms: i64,
+    /// Codecs (`Codec::bit`) whose clients need a keyframe.
+    key_mask: u8,
+    /// The captured frame itself, for VideoToolbox to encode without a copy.
+    #[cfg(target_os = "macos")]
+    pb: Option<crate::capture::PixBuf>,
 }
 
 fn union(a: Option<Band>, b: Band) -> Band {
@@ -57,6 +64,8 @@ fn union(a: Option<Band>, b: Band) -> Band {
 /// One capture/encode setup for the current screen size.
 struct Pipeline {
     cap: Capturer,
+    /// Frames go to VideoToolbox as captured (no I420 conversion or copies).
+    zero_copy: bool,
     job_tx: mpsc::SyncSender<Job>,
     ret_rx: mpsc::Receiver<(usize, Box<I420>)>,
     encode: std::thread::JoinHandle<()>,
@@ -79,17 +88,21 @@ pub fn spawn(
         .spawn(move || loop {
             let Pipeline {
                 mut cap,
+                zero_copy,
                 job_tx,
                 ret_rx,
                 encode,
             } = p;
-            if let Err(e) = capture_loop(&mut cap, cfg.clone(), hub.clone(), job_tx, ret_rx) {
+            if let Err(e) = capture_loop(&mut cap, cfg.clone(), hub.clone(), job_tx, ret_rx, zero_copy) {
                 #[cfg(target_os = "linux")]
                 let resized = cap.geometry_changed();
                 #[cfg(not(target_os = "linux"))]
                 let resized = false;
                 if resized {
                     log::info!("capture geometry changed: {e}");
+                } else if cfg!(target_os = "macos") {
+                    // ScreenCaptureKit drops streams on display changes; start over.
+                    log::warn!("capture loop ended: {e}; restarting capture");
                 } else {
                     log::error!("capture loop ended: {e}");
                     std::process::exit(1);
@@ -97,17 +110,38 @@ pub fn spawn(
             }
             drop(cap);
             let _ = encode.join();
+            #[cfg(target_os = "macos")]
+            if hub.vd_dirty.swap(false, Ordering::Relaxed) {
+                let req = hub.vd_req.lock().map(|(_, w, h, d)| (w, h, d));
+                let on = crate::mac::vdisplay::apply(req).is_some();
+                hub.hello_extra.lock().insert("virtual".into(), on.into());
+            }
             let req = hub.resize_req.lock().take();
             if let (Some(s), Some((w, h))) = (screen.as_mut(), req) {
                 if let Err(e) = s.resize(w, h) {
                     log::warn!("resize to {w}x{h} failed: {e}");
                 }
             }
-            p = match build(&cfg, &hub) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::error!("video restart failed: {e}");
-                    std::process::exit(1);
+            // Display changes (a virtual display coming or going) can briefly leave
+            // ScreenCaptureKit unable to start: retry, then give up the virtual display,
+            // before exiting for launchd to restart.
+            let mut tries = 0;
+            p = loop {
+                match build(&cfg, &hub) {
+                    Ok(p) => break p,
+                    Err(e) if tries < 4 => {
+                        tries += 1;
+                        log::warn!("video restart failed ({e}); retrying");
+                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                        #[cfg(target_os = "macos")]
+                        if tries == 3 && crate::mac::vdisplay::apply(None).is_none() {
+                            hub.hello_extra.lock().insert("virtual".into(), false.into());
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("video restart failed: {e}");
+                        std::process::exit(1);
+                    }
                 }
             };
         })
@@ -167,14 +201,44 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
     *hub.stripes.lock() = layout;
     let hub2 = hub.clone();
     let (crf, po_crf) = (cfg.crf, cfg.paintover_crf);
+    // One full-frame VideoToolbox stream: encode the capture's own pixel buffers, and
+    // offer HEVC to clients that ask for it.
+    #[cfg(target_os = "macos")]
+    let zero_copy = stripes.len() == 1 && matches!(stripes[0].enc, Encoder::Vt(_));
+    #[cfg(not(target_os = "macos"))]
+    let zero_copy = false;
+    let mut codecs = vec![crate::hub::Codec::H264];
+    #[cfg(target_os = "macos")]
+    if zero_copy && cfg.hevc {
+        use crate::vtenc::{supported, Kind};
+        if supported(Kind::Hevc) {
+            codecs.push(crate::hub::Codec::Hevc);
+        }
+        if supported(Kind::Hevc444) {
+            codecs.push(crate::hub::Codec::Hevc444);
+        }
+        log::info!(
+            "codecs offered: {:?} (HEVC hardware decode here: {})",
+            codecs,
+            crate::vtenc::hevc_hw_decode()
+        );
+    }
+    *hub.codecs.lock() = codecs;
     let encode = std::thread::Builder::new()
         .name("encode".into())
-        .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub2, crf, po_crf))
+        .spawn(move || {
+            #[cfg(target_os = "macos")]
+            if zero_copy {
+                return encode_loop_vt(stripes, job_rx, ret_tx, hub2, crf, po_crf);
+            }
+            encode_loop(stripes, job_rx, ret_tx, hub2, crf, po_crf)
+        })
         .unwrap();
     // New geometry (and a keyframe) for clients already connected; no-op at startup.
     hub.restart_clients();
     Ok(Pipeline {
         cap,
+        zero_copy,
         job_tx,
         ret_rx,
         encode,
@@ -462,6 +526,7 @@ fn capture_loop(
     hub: Arc<Hub>,
     job_tx: mpsc::SyncSender<Job>,
     ret_rx: mpsc::Receiver<(usize, Box<I420>)>,
+    zero_copy: bool,
 ) -> Result<(), String> {
     let (w, h) = (cap.width as usize, cap.height as usize);
     let mut pool: Vec<Option<Box<I420>>> = vec![
@@ -483,9 +548,28 @@ fn capture_loop(
     let mut full_next = true;
     let mut refiner = Refiner::new(w.div_ceil(16) * h.div_ceil(16), w.div_ceil(16));
     let debug_marker = std::env::var("VOXL_DEBUG_MARKER").is_ok();
+    // When a client last wanted 4:4:4 (the capture switches format, so not on every blip).
+    let mut last_444: Option<Instant> = None;
+    let _ = (&mut last_444, zero_copy);
 
     loop {
-        if hub.resize_req.lock().is_some() || cap.needs_rebuild() {
+        #[cfg(target_os = "macos")]
+        if zero_copy {
+            let any_444 = hub
+                .video_clients()
+                .iter()
+                .any(|c| c.codec() == crate::hub::Codec::Hevc444);
+            if any_444 {
+                last_444 = Some(Instant::now());
+                crate::capture::set_want_444(true);
+            } else if last_444.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
+                crate::capture::set_want_444(false);
+            }
+        }
+        if hub.resize_req.lock().is_some()
+            || cap.needs_rebuild()
+            || hub.vd_dirty.load(Ordering::Relaxed)
+        {
             return Ok(());
         }
         cap.pump()?;
@@ -527,9 +611,11 @@ fn capture_loop(
             continue;
         }
         rc.update(&hub, &clients);
-        let want_key = clients
+        let key_mask = clients
             .iter()
-            .any(|c| c.needs_keyframe.load(Ordering::Relaxed));
+            .filter(|c| c.needs_keyframe.load(Ordering::Relaxed))
+            .fold(0u8, |m, c| m | c.codec().bit());
+        let want_key = key_mask != 0;
         if !had_clients {
             had_clients = true;
             // Our shm copy may be stale: re-grab everything once.
@@ -648,7 +734,9 @@ fn capture_loop(
         }
         pending[idx] = None;
         if let Some(t) = todo {
-            cap.convert(&mut buf, t.y0 as usize, t.y1 as usize, cfg.convert_threads);
+            if !zero_copy {
+                cap.convert(&mut buf, t.y0 as usize, t.y1 as usize, cfg.convert_threads);
+            }
         }
         let t2 = Instant::now();
         hub.stats
@@ -722,6 +810,9 @@ fn capture_loop(
                 band,
                 captured_at: origin,
                 marker_ms,
+                key_mask,
+                #[cfg(target_os = "macos")]
+                pb: if zero_copy { cap.pixbuf() } else { None },
             })
             .is_err()
         {
@@ -1152,6 +1243,203 @@ fn encode_loop(
                 enc_us
             );
         }
+    }
+}
+
+/// The VideoToolbox path: every frame is the capture's own pixel buffer, encoded once
+/// per codec that connected clients use (H.264 for the web client, HEVC or HEVC 4:4:4
+/// for clients that asked), as one full-frame stream.
+#[cfg(target_os = "macos")]
+fn encode_loop_vt(
+    mut stripes_in: Vec<Stripe>,
+    rx: mpsc::Receiver<Job>,
+    ret: mpsc::Sender<(usize, Box<I420>)>,
+    hub: Arc<Hub>,
+    crf: f32,
+    po_crf: f32,
+) {
+    use crate::hub::Codec;
+    use crate::vtenc::{Kind, Vt};
+    struct Var {
+        enc: Option<Vt>,
+        applied_kbps: u32,
+        applied_crf: f32,
+        idle_since: Option<Instant>,
+    }
+    let s = stripes_in.pop().expect("one stripe");
+    let cfg = s.cfg.clone();
+    let mut vars: Vec<Var> = Codec::ALL
+        .iter()
+        .map(|_| Var {
+            enc: None,
+            applied_kbps: 0,
+            applied_crf: -1.0,
+            idle_since: None,
+        })
+        .collect();
+    if let Encoder::Vt(v) = s.enc {
+        vars[0].enc = Some(v);
+    }
+    let kind = |c: Codec| match c {
+        Codec::H264 => Kind::H264,
+        Codec::Hevc => Kind::Hevc,
+        Codec::Hevc444 => Kind::Hevc444,
+    };
+    let epoch = Instant::now();
+    let mut frame_id: u32 = 0;
+    while let Ok(job) = rx.recv() {
+        let t0 = Instant::now();
+        let Some(pb) = job.pb.as_ref() else {
+            let _ = ret.send((job.idx, job.buf));
+            continue;
+        };
+        let clients = hub.video_clients();
+        let active = clients.iter().fold(0u8, |m, c| m | c.codec().bit());
+        let target = hub.target_kbps.load(Ordering::Relaxed);
+        let want_crf = if job.paintover { po_crf } else { crf };
+        // Same budget as one stripe of the x264 path: up to twice the target per frame
+        // stream, four times for paint-over.
+        let share = target.saturating_mul(2).max(target + 1);
+        let cap = if job.paintover { share.saturating_mul(2) } else { share };
+        let ts = job.captured_at.duration_since(epoch).as_millis() as i64;
+        let mut results: Vec<Option<(bool, Vec<u8>)>> = vec![None, None, None];
+        let mut submitted = [false; 3];
+        for c in Codec::ALL {
+            let v = &mut vars[c as usize];
+            if active & c.bit() == 0 {
+                // Keep an unused session a little while (a client reconnecting), not forever.
+                if c != Codec::H264 && v.enc.is_some() {
+                    let since = *v.idle_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= Duration::from_secs(10) {
+                        v.enc = None;
+                        v.idle_since = None;
+                    }
+                }
+                continue;
+            }
+            v.idle_since = None;
+            let mut fresh = false;
+            if v.enc.is_none() {
+                match Vt::with_kind(&cfg, kind(c), c != Codec::H264) {
+                    Ok(e) => {
+                        v.enc = Some(e);
+                        v.applied_kbps = 0;
+                        fresh = true;
+                    }
+                    Err(e) => {
+                        // Can't make it after all: those clients go back to H.264.
+                        log::error!("{e}; moving {} clients to h264", c.name());
+                        hub.codecs.lock().retain(|x| *x != c);
+                        for cl in clients.iter().filter(|cl| cl.codec() == c) {
+                            cl.codec.store(Codec::H264 as u8, Ordering::Relaxed);
+                            cl.started.store(false, Ordering::Relaxed);
+                            cl.needs_keyframe.store(true, Ordering::Relaxed);
+                            cl.inflight.lock().clear();
+                            cl.send(Out::Text("{\"t\":\"codec\",\"c\":\"h264\"}".into()));
+                        }
+                        hub.wake();
+                        continue;
+                    }
+                }
+            }
+            let force = fresh || job.key_mask & c.bit() != 0;
+            let enc = v.enc.as_mut().unwrap();
+            if force {
+                // A keyframe is what a new viewer sees first; don't starve it.
+                let boost = cap.saturating_mul(4).max(16_000);
+                enc.set_rate_buf(want_crf, boost, boost / cfg.fps.max(1) * 8);
+                v.applied_kbps = 0;
+            } else {
+                let moved = v.applied_kbps == 0
+                    || (cap as f64 - v.applied_kbps as f64).abs() > v.applied_kbps as f64 * 0.04;
+                if want_crf != v.applied_crf || moved {
+                    enc.set_rate(want_crf, cap);
+                    v.applied_crf = want_crf;
+                    v.applied_kbps = cap;
+                }
+            }
+            match unsafe { enc.submit(pb.ptr(), ts, force) } {
+                Ok(()) => submitted[c as usize] = true,
+                Err(e) => log::error!("{e}"),
+            }
+        }
+        // Every codec's session encodes this frame at the same time; collect them.
+        for c in Codec::ALL {
+            if !submitted[c as usize] {
+                continue;
+            }
+            let mut out = Vec::with_capacity(64 << 10);
+            out.resize(HDR, 0);
+            match vars[c as usize].enc.as_mut().unwrap().finish(&mut out) {
+                Ok(key) if out.len() > HDR => results[c as usize] = Some((key, out)),
+                Ok(_) => {}
+                Err(e) => log::error!("{e}"),
+            }
+        }
+        let _ = ret.send((job.idx, job.buf));
+        if results.iter().all(|r| r.is_none()) {
+            continue;
+        }
+        let enc_us = t0.elapsed().as_micros() as u64;
+        let total: usize = results.iter().flatten().map(|r| r.1.len()).sum();
+        hub.stats.encode_us.fetch_add(enc_us, Ordering::Relaxed);
+        hub.stats.encoded.fetch_add(1, Ordering::Relaxed);
+        hub.stats.bytes.fetch_add(total as u64, Ordering::Relaxed);
+        if results.iter().flatten().any(|r| r.0) {
+            hub.stats.keyframes.fetch_add(1, Ordering::Relaxed);
+        }
+        frame_id = frame_id.wrapping_add(1);
+        let pipe = (job.captured_at.elapsed().as_micros() / 100).min(u32::MAX as u128) as u32;
+        let msgs: Vec<Option<(bool, usize, Bytes)>> = results
+            .into_iter()
+            .map(|r| {
+                r.map(|(key, mut out)| {
+                    out[0] = 0x01;
+                    out[1] = (key as u8) | if job.paintover { 2 } else { 0 };
+                    out[2..6].copy_from_slice(&frame_id.to_be_bytes());
+                    out[6..10].copy_from_slice(&pipe.to_be_bytes());
+                    out[10] = 0;
+                    out[11] = 1;
+                    out[12] = 1;
+                    out[13] = 0;
+                    out[14..16].copy_from_slice(&0u16.to_be_bytes());
+                    let n = out.len();
+                    (key, n, Bytes::from(out))
+                })
+            })
+            .collect();
+        let now = Instant::now();
+        for c in hub.video_clients() {
+            let Some((key, n, m)) = &msgs[c.codec() as usize] else {
+                continue;
+            };
+            if !c.started.load(Ordering::Relaxed) {
+                if !key {
+                    continue;
+                }
+                c.started.store(true, Ordering::Relaxed);
+                c.inflight.lock().clear();
+            }
+            {
+                let mut q = c.inflight.lock();
+                if q.len() > 600 {
+                    log::warn!("client {} hopelessly behind; dropping", c.id);
+                    drop(q);
+                    c.send(Out::Text("{\"t\":\"close\"}".into()));
+                    continue;
+                }
+                q.push_back(Inflight {
+                    id: frame_id,
+                    sent: now,
+                    bytes: *n,
+                });
+            }
+            c.send(Out::Bin(m.clone()));
+        }
+        hub.stats.send_lat_us.fetch_add(
+            job.captured_at.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
     }
 }
 

@@ -96,6 +96,7 @@ extern "C" {
     pub fn CGDisplayModeGetIODisplayModeID(m: CGDisplayModeRef) -> i32;
     pub fn CGDisplayModeRelease(m: CGDisplayModeRef);
     pub fn CGBeginDisplayConfiguration(config: *mut CGDisplayConfigRef) -> i32;
+    pub fn CGDisplayVendorNumber(id: u32) -> u32;
     pub fn CGConfigureDisplayWithDisplayMode(
         config: CGDisplayConfigRef,
         display: u32,

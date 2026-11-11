@@ -156,6 +156,56 @@ pub fn convert_nv12_band(
 }
 
 /// An NV12 frame (BT.601 limited range, as ScreenCaptureKit delivers it) as packed BGRX.
+/// Copy rows [y0, y1) of a 4:4:4 bi-planar frame into `dst` (I420): luma as it is,
+/// chroma averaged over each 2x2 block (only the x264 fallback needs this).
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub fn convert_444_band(
+    src_y: *const u8,
+    stride_y: usize,
+    src_uv: *const u8,
+    stride_uv: usize,
+    dst: &mut I420,
+    y0: usize,
+    y1: usize,
+) {
+    let w = dst.width;
+    let suv = dst.stride_uv();
+    unsafe {
+        for r in y0..y1 {
+            std::ptr::copy_nonoverlapping(src_y.add(r * stride_y), dst.y.as_mut_ptr().add(r * w), w);
+        }
+        for r in (y0 / 2)..y1.div_ceil(2) {
+            let a = src_uv.add(2 * r * stride_uv);
+            let b = src_uv.add((2 * r + 1).min(y1 - 1) * stride_uv);
+            for c in 0..w / 2 {
+                let o = 4 * c;
+                let u = (*a.add(o) as u32 + *a.add(o + 2) as u32 + *b.add(o) as u32 + *b.add(o + 2) as u32 + 2) / 4;
+                let v = (*a.add(o + 1) as u32 + *a.add(o + 3) as u32 + *b.add(o + 1) as u32 + *b.add(o + 3) as u32 + 2) / 4;
+                dst.u[r * suv + c] = u as u8;
+                dst.v[r * suv + c] = v as u8;
+            }
+        }
+    }
+}
+
+/// 4:4:4 bi-planar (BT.601 video range) to packed BGRX, for screenshots.
+#[cfg(target_os = "macos")]
+pub fn yuv444_to_bgrx(y: &[u8], ys: usize, uv: &[u8], uvs: usize, w: usize, h: usize, out: &mut [u8]) {
+    for r in 0..h {
+        for c in 0..w {
+            let yy = (y[r * ys + c] as i32 - 16) * 298;
+            let u = uv[r * uvs + 2 * c] as i32 - 128;
+            let v = uv[r * uvs + 2 * c + 1] as i32 - 128;
+            let o = (r * w + c) * 4;
+            out[o] = ((yy + 516 * u + 128) >> 8).clamp(0, 255) as u8;
+            out[o + 1] = ((yy - 100 * u - 208 * v + 128) >> 8).clamp(0, 255) as u8;
+            out[o + 2] = ((yy + 409 * v + 128) >> 8).clamp(0, 255) as u8;
+            out[o + 3] = 255;
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub fn nv12_to_bgrx(
     y: &[u8],

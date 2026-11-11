@@ -175,6 +175,7 @@ async fn serve(a: HashMap<String, String>) {
         // threads cost ~3x the CPU on desktop content, so this saves 20-55% CPU, but
         // small updates encode a few ms slower on one thread.
         adaptive_threads: truthy(a.get("adaptive-threads"), false),
+        hevc: truthy(a.get("hevc"), true),
         coalesce: std::time::Duration::from_micros(range_max(a.get("coalesce-us"), 0.0) as u64),
     };
     let clip = a
@@ -323,6 +324,14 @@ async fn serve(a: HashMap<String, String>) {
         extra.insert("mic".into(), mic.is_some().into());
         if read_only {
             extra.insert("readOnly".into(), true.into());
+        }
+        // --virtual-display (macOS, experimental, default off): a client may ask for a
+        // display of its own size (vd,W,H,scale) instead of the real screen. On a
+        // headless Mac it replaces the only display for every voxl and viewer.
+        #[cfg(target_os = "macos")]
+        if !read_only && truthy(a.get("virtual-display"), false) && mac::vdisplay::available() {
+            hub.vd_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+            extra.insert("vd".into(), true.into());
         }
         extra.insert(
             "files".into(),

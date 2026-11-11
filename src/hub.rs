@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -11,6 +11,41 @@ use tokio::sync::mpsc;
 pub enum Out {
     Bin(Bytes),
     Text(String),
+}
+
+/// Video codec a client receives. Every client gets H.264 unless it asks for HEVC
+/// (`cd,<codec>,...`) and this server can encode it in hardware.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum Codec {
+    H264 = 0,
+    Hevc = 1,
+    /// HEVC Main 4:4:4: full-resolution color.
+    Hevc444 = 2,
+}
+
+impl Codec {
+    pub const ALL: [Codec; 3] = [Codec::H264, Codec::Hevc, Codec::Hevc444];
+    pub fn name(self) -> &'static str {
+        match self {
+            Codec::H264 => "h264",
+            Codec::Hevc => "hevc",
+            Codec::Hevc444 => "hevc444",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Codec> {
+        Codec::ALL.into_iter().find(|c| c.name() == s)
+    }
+    pub fn from_u8(v: u8) -> Codec {
+        match v {
+            1 => Codec::Hevc,
+            2 => Codec::Hevc444,
+            _ => Codec::H264,
+        }
+    }
+    pub fn bit(self) -> u8 {
+        1 << self as u8
+    }
 }
 
 pub struct Inflight {
@@ -33,6 +68,8 @@ pub struct Client {
     /// Has received a keyframe since (re)starting video.
     pub started: AtomicBool,
     pub delay: Mutex<DelayEst>,
+    /// `Codec` as u8.
+    pub codec: AtomicU8,
 }
 
 /// Send->ack delay tracking: `base` is the (slowly expiring) minimum, the excess over
@@ -50,6 +87,10 @@ pub struct RateEst {
 }
 
 impl Client {
+    pub fn codec(&self) -> Codec {
+        Codec::from_u8(self.codec.load(Ordering::Relaxed))
+    }
+
     pub fn send(&self, m: Out) {
         let _ = self.tx.send(m);
     }
@@ -260,6 +301,14 @@ pub struct Hub {
     pub snapshots: Mutex<Vec<tokio::sync::oneshot::Sender<Arc<crate::record::Snapshot>>>>,
     /// When each part of the screen last changed (`/wait`).
     pub activity: crate::wait::Activity,
+    /// Codecs clients may ask for (H.264 always; HEVC with a hardware encoder).
+    pub codecs: Mutex<Vec<Codec>>,
+    /// Clients may ask for a virtual display sized to them (macOS).
+    pub vd_enabled: AtomicBool,
+    /// The virtual display asked for: (client, width, height, HiDPI).
+    pub vd_req: Mutex<Option<(u64, u32, u32, bool)>>,
+    /// `vd_req` changed; the video thread applies it.
+    pub vd_dirty: AtomicBool,
 }
 
 impl Hub {
@@ -281,6 +330,10 @@ impl Hub {
             hello_extra: Mutex::new(serde_json::Map::new()),
             snapshots: Mutex::new(Vec::new()),
             activity: Default::default(),
+            codecs: Mutex::new(vec![Codec::H264]),
+            vd_enabled: AtomicBool::new(false),
+            vd_req: Mutex::new(None),
+            vd_dirty: AtomicBool::new(false),
         })
     }
 
@@ -312,6 +365,7 @@ impl Hub {
                 base_at: Instant::now(),
                 queue_ms: 0.0,
             }),
+            codec: AtomicU8::new(Codec::H264 as u8),
         });
         self.clients.lock().push(c.clone());
         c
@@ -319,6 +373,13 @@ impl Hub {
 
     pub fn remove_client(&self, id: u64) {
         self.clients.lock().retain(|c| c.id != id);
+        // Its virtual display goes with it.
+        let mut vd = self.vd_req.lock();
+        if vd.is_some_and(|v| v.0 == id) {
+            *vd = None;
+            self.vd_dirty.store(true, Ordering::Relaxed);
+        }
+        drop(vd);
         self.wake();
     }
 
@@ -338,6 +399,8 @@ impl Hub {
         m.insert("w".into(), self.width.load(Ordering::Relaxed).into());
         m.insert("h".into(), self.height.load(Ordering::Relaxed).into());
         m.insert("stripes".into(), serde_json::json!(*self.stripes.lock()));
+        let codecs: Vec<&str> = self.codecs.lock().iter().map(|c| c.name()).collect();
+        m.insert("codecs".into(), serde_json::json!(codecs));
         serde_json::Value::Object(m).to_string()
     }
 

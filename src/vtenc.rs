@@ -1,9 +1,13 @@
-//! Hardware H.264 encoding with Apple's VideoToolbox (macOS).
+//! Hardware H.264 and HEVC encoding with Apple's VideoToolbox (macOS).
 //!
-//! Same contract as the x264 encoder: I420 planes in, Annex-B out (SPS/PPS repeated on
+//! Same contract as the x264 encoder: Annex-B out (parameter sets repeated on
 //! keyframes), no B-frames, keyframes only when asked for. Frames are encoded
 //! synchronously: `VTCompressionSessionCompleteFrames` blocks until the output
 //! callback has run, so one `encode` call yields that frame's bytes.
+//!
+//! Input is either I420 planes (copied into a pixel buffer, like x264's input) or,
+//! without any copy, the ScreenCaptureKit pixel buffer itself (`encode_pb`). HEVC
+//! Main 4:4:4 needs a 4:4:4 source ('444v' from ScreenCaptureKit).
 
 #![allow(non_upper_case_globals, non_snake_case)]
 
@@ -66,10 +70,13 @@ extern "C" {
     ) -> OSStatus;
     fn VTCompressionSessionCompleteFrames(s: *mut c_void, until: CMTime) -> OSStatus;
     fn VTCompressionSessionInvalidate(s: *mut c_void);
+    fn VTIsHardwareDecodeSupported(codec: u32) -> u8;
 
     static kVTCompressionPropertyKey_RealTime: CFStringRef;
+    static kVTCompressionPropertyKey_MaxFrameDelayCount: CFStringRef;
     static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
     static kVTProfileLevel_H264_High_AutoLevel: CFStringRef;
+    static kVTProfileLevel_HEVC_Main_AutoLevel: CFStringRef;
     static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
     static kVTCompressionPropertyKey_MaxKeyFrameInterval: CFStringRef;
     static kVTCompressionPropertyKey_AverageBitRate: CFStringRef;
@@ -82,6 +89,7 @@ extern "C" {
     static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
     static kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: CFStringRef;
     static kVTVideoEncoderSpecification_EnableLowLatencyRateControl: CFStringRef;
+    static kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: CFStringRef;
 }
 
 #[link(name = "CoreVideo", kind = "framework")]
@@ -109,8 +117,23 @@ extern "C" {
     fn CMSampleBufferGetFormatDescription(sb: *const c_void) -> *const c_void;
     fn CMSampleBufferGetSampleAttachmentsArray(sb: *const c_void, create: bool) -> *const c_void;
     fn CMBlockBufferGetDataLength(bb: *mut c_void) -> usize;
+    fn CMBlockBufferGetDataPointer(
+        bb: *mut c_void,
+        off: usize,
+        len_at_off: *mut usize,
+        total: *mut usize,
+        ptr: *mut *mut u8,
+    ) -> OSStatus;
     fn CMBlockBufferCopyDataBytes(bb: *mut c_void, off: usize, len: usize, dst: *mut u8) -> OSStatus;
     fn CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+        fd: *const c_void,
+        idx: usize,
+        ptr: *mut *const u8,
+        size: *mut usize,
+        count: *mut usize,
+        nal_len: *mut i32,
+    ) -> OSStatus;
+    fn CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
         fd: *const c_void,
         idx: usize,
         ptr: *mut *const u8,
@@ -138,6 +161,7 @@ extern "C" {
     ) -> CFDictionaryRef;
     fn CFDictionaryGetValue(d: *const c_void, k: CFTypeRef) -> CFTypeRef;
     fn CFBooleanGetValue(b: CFTypeRef) -> u8;
+    fn CFStringCreateWithCString(a: CFAllocatorRef, s: *const std::ffi::c_char, enc: u32) -> CFStringRef;
     static kCFBooleanTrue: CFTypeRef;
     static kCFBooleanFalse: CFTypeRef;
     static kCFTypeArrayCallBacks: u8;
@@ -146,6 +170,17 @@ extern "C" {
 }
 
 const K_CMVIDEOCODEC_H264: u32 = u32::from_be_bytes(*b"avc1");
+const K_CMVIDEOCODEC_HEVC: u32 = u32::from_be_bytes(*b"hvc1");
+
+/// What a VideoToolbox session produces.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    H264,
+    /// HEVC Main (4:2:0).
+    Hevc,
+    /// HEVC Main 4:4:4 (Range Extensions): full-resolution color, for sharp colored text.
+    Hevc444,
+}
 const K_CVPIXFMT_NV12_VIDEO: u32 = u32::from_be_bytes(*b"420v");
 const CFNUM_SINT32: isize = 3;
 const CFNUM_FLOAT64: isize = 13;
@@ -172,10 +207,12 @@ struct Output {
     data: Vec<u8>,
     key: bool,
     err: Option<OSStatus>,
+    hevc: bool,
 }
 
 pub struct Vt {
     s: *mut c_void,
+    /// Pixel buffer for I420 input, made on first use (zero-copy input needs none).
     pb: *mut c_void,
     out: Box<Mutex<Output>>,
     force_key: CFDictionaryRef,
@@ -205,16 +242,16 @@ extern "C" fn on_output(refcon: *mut c_void, _f: *mut c_void, status: OSStatus, 
         o.key = key;
         if key {
             let fd = CMSampleBufferGetFormatDescription(sb);
+            let get = if o.hevc {
+                CMVideoFormatDescriptionGetHEVCParameterSetAtIndex
+            } else {
+                CMVideoFormatDescriptionGetH264ParameterSetAtIndex
+            };
             let mut count = 0usize;
-            CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                fd, 0, ptr::null_mut(), ptr::null_mut(), &mut count, ptr::null_mut(),
-            );
+            get(fd, 0, ptr::null_mut(), ptr::null_mut(), &mut count, ptr::null_mut());
             for i in 0..count {
                 let (mut p, mut n) = (ptr::null::<u8>(), 0usize);
-                if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                    fd, i, &mut p, &mut n, ptr::null_mut(), ptr::null_mut(),
-                ) == 0
-                {
+                if get(fd, i, &mut p, &mut n, ptr::null_mut(), ptr::null_mut()) == 0 {
                     o.data.extend_from_slice(&[0, 0, 0, 1]);
                     o.data.extend_from_slice(std::slice::from_raw_parts(p, n));
                 }
@@ -222,8 +259,20 @@ extern "C" fn on_output(refcon: *mut c_void, _f: *mut c_void, status: OSStatus, 
         }
         let bb = CMSampleBufferGetDataBuffer(sb);
         let len = CMBlockBufferGetDataLength(bb);
-        let mut avcc = vec![0u8; len];
-        CMBlockBufferCopyDataBytes(bb, 0, len, avcc.as_mut_ptr());
+        // Read the encoder's buffer in place when it is contiguous (it normally is).
+        let (mut contig, mut base) = (0usize, ptr::null_mut::<u8>());
+        let mut copy = Vec::new();
+        let avcc: &[u8] = if CMBlockBufferGetDataPointer(bb, 0, &mut contig, ptr::null_mut(), &mut base) == 0
+            && contig == len
+            && !base.is_null()
+        {
+            std::slice::from_raw_parts(base, len)
+        } else {
+            copy.resize(len, 0);
+            CMBlockBufferCopyDataBytes(bb, 0, len, copy.as_mut_ptr());
+            &copy
+        };
+        o.data.reserve(len + 16);
         // AVCC (4-byte big-endian lengths) -> Annex-B start codes.
         let mut i = 0;
         while i + 4 <= len {
@@ -244,42 +293,120 @@ fn quality_for(crf: f32) -> f64 {
     (1.0 - (crf as f64 - 10.0) / 40.0).clamp(0.3, 0.95)
 }
 
-impl Vt {
-    pub fn new(cfg: &EncoderConfig) -> Result<Self, String> {
-        unsafe {
-            let out: Box<Mutex<Output>> = Box::default();
-            let spec = dict(
-                &[
-                    kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder,
-                    kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
-                ],
-                &[kCFBooleanTrue, kCFBooleanTrue],
-            );
-            let mut s = ptr::null_mut();
-            let st = VTCompressionSessionCreate(
-                ptr::null(),
-                cfg.width as i32,
-                cfg.height as i32,
-                K_CMVIDEOCODEC_H264,
-                spec,
-                ptr::null(),
-                ptr::null(),
-                on_output,
-                &*out as *const Mutex<Output> as *mut c_void,
-                &mut s,
-            );
-            CFRelease(spec);
-            if st != 0 || s.is_null() {
-                return Err(format!("VTCompressionSessionCreate failed: {st}"));
+unsafe fn cfstr(s: &str) -> CFStringRef {
+    let c = std::ffi::CString::new(s).unwrap();
+    CFStringCreateWithCString(ptr::null(), c.as_ptr(), 0x0800_0100)
+}
+
+/// Whether this Mac's hardware encoder can make `kind` (probed once per kind).
+pub fn supported(kind: Kind) -> bool {
+    use std::sync::OnceLock;
+    static H264: OnceLock<bool> = OnceLock::new();
+    static HEVC: OnceLock<bool> = OnceLock::new();
+    static HEVC444: OnceLock<bool> = OnceLock::new();
+    let cell = match kind {
+        Kind::H264 => &H264,
+        Kind::Hevc => &HEVC,
+        Kind::Hevc444 => &HEVC444,
+    };
+    *cell.get_or_init(|| {
+        let cfg = EncoderConfig {
+            width: 640,
+            height: 360,
+            fps: 60,
+            preset: String::new(),
+            threads: 1,
+            crf: 24.0,
+            max_kbps: 4000,
+        };
+        match Vt::with_kind(&cfg, kind, true) {
+            Ok(_) => true,
+            Err(e) => {
+                log::info!("VideoToolbox {kind:?} unavailable: {e}");
+                false
             }
-            let set = |k: CFStringRef, v: CFTypeRef| {
-                let r = VTSessionSetProperty(s, k, v);
-                if r != 0 {
-                    log::debug!("VTSessionSetProperty failed: {r}");
+        }
+    })
+}
+
+/// Whether the hardware can decode HEVC here (logged for diagnostics).
+pub fn hevc_hw_decode() -> bool {
+    unsafe { VTIsHardwareDecodeSupported(K_CMVIDEOCODEC_HEVC) != 0 }
+}
+
+impl Vt {
+    /// H.264 (the default encoder for every client that doesn't ask for HEVC).
+    pub fn new(cfg: &EncoderConfig) -> Result<Self, String> {
+        Self::with_kind(cfg, Kind::H264, false)
+    }
+
+    /// A session for `kind`; `require_hw` refuses a software encoder (HEVC only makes
+    /// sense here in hardware).
+    pub fn with_kind(cfg: &EncoderConfig, kind: Kind, require_hw: bool) -> Result<Self, String> {
+        unsafe {
+            let out: Box<Mutex<Output>> = Box::new(Mutex::new(Output {
+                hevc: kind != Kind::H264,
+                ..Default::default()
+            }));
+            let hw_key = if require_hw || kind != Kind::H264 {
+                kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder
+            } else {
+                kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder
+            };
+            let codec = if kind == Kind::H264 { K_CMVIDEOCODEC_H264 } else { K_CMVIDEOCODEC_HEVC };
+            let mut s = ptr::null_mut();
+            let mut st = -1;
+            // Low-latency rate control first; older systems lack it for HEVC.
+            for low_latency in [true, false] {
+                let spec = if low_latency {
+                    dict(
+                        &[hw_key, kVTVideoEncoderSpecification_EnableLowLatencyRateControl],
+                        &[kCFBooleanTrue, kCFBooleanTrue],
+                    )
+                } else {
+                    dict(&[hw_key], &[kCFBooleanTrue])
+                };
+                st = VTCompressionSessionCreate(
+                    ptr::null(),
+                    cfg.width as i32,
+                    cfg.height as i32,
+                    codec,
+                    spec,
+                    ptr::null(),
+                    ptr::null(),
+                    on_output,
+                    &*out as *const Mutex<Output> as *mut c_void,
+                    &mut s,
+                );
+                CFRelease(spec);
+                if st == 0 && !s.is_null() {
+                    break;
+                }
+            }
+            if st != 0 || s.is_null() {
+                return Err(format!("VTCompressionSessionCreate ({kind:?}) failed: {st}"));
+            }
+            let set = |k: CFStringRef, v: CFTypeRef| VTSessionSetProperty(s, k, v);
+            set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
+            let z = num_i32(0);
+            set(kVTCompressionPropertyKey_MaxFrameDelayCount, z);
+            CFRelease(z);
+            let prof_st = match kind {
+                Kind::H264 => set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel),
+                Kind::Hevc => set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel),
+                Kind::Hevc444 => {
+                    // Not in the public headers; the encoder lists it as a supported value.
+                    let p = cfstr("HEVC_Main444_AutoLevel");
+                    let r = set(kVTCompressionPropertyKey_ProfileLevel, p);
+                    CFRelease(p);
+                    r
                 }
             };
-            set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
-            set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel);
+            if prof_st != 0 {
+                VTCompressionSessionInvalidate(s);
+                CFRelease(s);
+                return Err(format!("{kind:?} profile not supported ({prof_st})"));
+            }
             set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
             let n = num_i32(i32::MAX);
             set(kVTCompressionPropertyKey_MaxKeyFrameInterval, n);
@@ -290,24 +417,10 @@ impl Vt {
             set(kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2);
             set(kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
             set(kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4);
-            let mut pb = ptr::null_mut();
-            if CVPixelBufferCreate(
-                ptr::null(),
-                cfg.width as usize,
-                cfg.height as usize,
-                K_CVPIXFMT_NV12_VIDEO,
-                ptr::null(),
-                &mut pb,
-            ) != 0
-            {
-                VTCompressionSessionInvalidate(s);
-                CFRelease(s);
-                return Err("CVPixelBufferCreate failed".into());
-            }
             let force_key = dict(&[kVTEncodeFrameOptionKey_ForceKeyFrame], &[kCFBooleanTrue]);
             let mut v = Vt {
                 s,
-                pb,
+                pb: ptr::null_mut(),
                 out,
                 force_key,
                 pts: 0,
@@ -317,7 +430,7 @@ impl Vt {
             };
             v.set_rate(cfg.crf, cfg.max_kbps);
             VTCompressionSessionPrepareToEncodeFrames(s);
-            log::info!("VideoToolbox H.264 encoder {}x{}", cfg.width, cfg.height);
+            log::info!("VideoToolbox {kind:?} encoder {}x{}", cfg.width, cfg.height);
             Ok(v)
         }
     }
@@ -359,6 +472,7 @@ impl Vt {
         }
     }
 
+    /// Encodes I420 planes: copied into this session's own NV12 buffer first.
     pub fn encode(
         &mut self,
         p: &Planes,
@@ -368,6 +482,12 @@ impl Vt {
     ) -> Result<bool, String> {
         let (w, h) = (self.width as usize, self.height as usize);
         unsafe {
+            if self.pb.is_null()
+                && CVPixelBufferCreate(ptr::null(), w, h, K_CVPIXFMT_NV12_VIDEO, ptr::null(), &mut self.pb) != 0
+            {
+                self.pb = ptr::null_mut();
+                return Err("CVPixelBufferCreate failed".into());
+            }
             CVPixelBufferLockBaseAddress(self.pb, 0);
             let y = CVPixelBufferGetBaseAddressOfPlane(self.pb, 0) as *mut u8;
             let ys = CVPixelBufferGetBytesPerRowOfPlane(self.pb, 0);
@@ -386,23 +506,59 @@ impl Vt {
                 }
             }
             CVPixelBufferUnlockBaseAddress(self.pb, 0);
-
-            self.pts = ts_ms.max(self.pts + 1);
-            *self.out.lock() = Output::default();
-            let st = VTCompressionSessionEncodeFrame(
-                self.s,
-                self.pb,
-                cmtime(self.pts),
-                cmtime_invalid(),
-                if force_idr { self.force_key } else { ptr::null() },
-                ptr::null_mut(),
-                ptr::null_mut(),
-            );
-            if st != 0 {
-                return Err(format!("VTCompressionSessionEncodeFrame failed: {st}"));
-            }
-            VTCompressionSessionCompleteFrames(self.s, cmtime(self.pts));
+            let pb = self.pb;
+            self.encode_pb(pb, ts_ms, force_idr, out)
         }
+    }
+
+    /// Encodes a pixel buffer as it is (a ScreenCaptureKit frame: no CPU copy). The
+    /// session retains it for as long as it needs it.
+    ///
+    /// # Safety
+    /// `pb` must be a valid CVPixelBuffer of this session's size.
+    pub unsafe fn encode_pb(
+        &mut self,
+        pb: *mut c_void,
+        ts_ms: i64,
+        force_idr: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, String> {
+        self.submit(pb, ts_ms, force_idr)?;
+        self.finish(out)
+    }
+
+    /// Starts encoding `pb`; `finish` waits for it. Several sessions can encode the
+    /// same frame at once this way.
+    ///
+    /// # Safety
+    /// `pb` must be a valid CVPixelBuffer of this session's size.
+    pub unsafe fn submit(&mut self, pb: *mut c_void, ts_ms: i64, force_idr: bool) -> Result<(), String> {
+        self.pts = ts_ms.max(self.pts + 1);
+        {
+            let mut o = self.out.lock();
+            o.data.clear();
+            o.key = false;
+            o.err = None;
+        }
+        let st = VTCompressionSessionEncodeFrame(
+            self.s,
+            pb,
+            cmtime(self.pts),
+            cmtime_invalid(),
+            if force_idr { self.force_key } else { ptr::null() },
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
+        if st != 0 {
+            return Err(format!("VTCompressionSessionEncodeFrame failed: {st}"));
+        }
+        Ok(())
+    }
+
+    /// Waits for the frame `submit` started and appends its Annex-B bytes to `out`;
+    /// returns whether it is a keyframe.
+    pub fn finish(&mut self, out: &mut Vec<u8>) -> Result<bool, String> {
+        unsafe { VTCompressionSessionCompleteFrames(self.s, cmtime(self.pts)) };
         let mut o = self.out.lock();
         if let Some(e) = o.err {
             return Err(format!("VideoToolbox encode error {e}"));
@@ -418,7 +574,9 @@ impl Drop for Vt {
             VTCompressionSessionCompleteFrames(self.s, cmtime_invalid());
             VTCompressionSessionInvalidate(self.s);
             CFRelease(self.s);
-            CFRelease(self.pb);
+            if !self.pb.is_null() {
+                CFRelease(self.pb);
+            }
             CFRelease(self.force_key);
         }
     }

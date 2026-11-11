@@ -300,7 +300,7 @@ fn num<T: std::str::FromStr>(it: &mut std::str::Split<'_, char>) -> Option<T> {
 /// Commands a --read-only viewer may send: acks, video and audio on/off, keyframe
 /// requests and ping replies. Everything else acts on the desktop (input, clipboard,
 /// microphone, resizing) and is dropped. The web client keeps the same list.
-const READ_ONLY_COMMANDS: &[&str] = &["a", "v", "au", "kf", "po"];
+const READ_ONLY_COMMANDS: &[&str] = &["a", "v", "au", "kf", "po", "cd", "cl"];
 
 fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collections::VecDeque<u32>) {
     let (cmd, rest) = t.split_once(',').unwrap_or((t, ""));
@@ -395,6 +395,55 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
                 s.hub.wake();
             }
         }
+        // cd,hevc444,hevc,h264: the codecs this client decodes, best first. The server
+        // picks the first it can encode and says which ({"t":"codec","c":...}).
+        "cd" => {
+            let supported = s.hub.codecs.lock().clone();
+            let pick = rest
+                .split(',')
+                .filter_map(|n| crate::hub::Codec::parse(n.trim()))
+                .find(|c| supported.contains(c))
+                .unwrap_or(crate::hub::Codec::H264);
+            let old = c.codec.swap(pick as u8, Ordering::Relaxed);
+            if old != pick as u8 {
+                c.inflight.lock().clear();
+                c.started.store(false, Ordering::Relaxed);
+                c.needs_keyframe.store(true, Ordering::Relaxed);
+            }
+            log::info!("client {} asked for [{rest}]: sending {}", c.id, pick.name());
+            c.send(Out::Text(format!("{{\"t\":\"codec\",\"c\":\"{}\"}}", pick.name())));
+            s.hub.wake();
+        }
+        // vd,W,H,scale: put up a virtual display of W x H pixels (scale 2: HiDPI) for this
+        // client and stream it instead of the real screen; vd,0 takes it down. It also
+        // goes when the client disconnects.
+        "vd" if s.hub.vd_enabled.load(Ordering::Relaxed) => {
+            let w = num::<u32>(&mut it).unwrap_or(0);
+            let h = num::<u32>(&mut it).unwrap_or(0);
+            let k = num::<u32>(&mut it).unwrap_or(1);
+            let mut r = s.hub.vd_req.lock();
+            let want = if w == 0 {
+                if r.is_some_and(|x| x.0 != c.id) {
+                    return;
+                }
+                None
+            } else if (640..=7680).contains(&w) && (480..=4320).contains(&h) {
+                Some((c.id, w, h, k >= 2))
+            } else {
+                return;
+            };
+            if *r != want {
+                log::info!("client {} asks for virtual display {w}x{h} scale {k}", c.id);
+                *r = want;
+                s.hub.vd_dirty.store(true, Ordering::Relaxed);
+                s.hub.wake();
+            }
+        }
+        // cl,<text>: a client's diagnostics line (decoder self-test results), logged.
+        "cl" => {
+            let t: String = rest.chars().take(300).filter(|c| !c.is_control()).collect();
+            log::info!("client {} reports: {t}", c.id);
+        }
         "kf" => {
             c.started.store(false, Ordering::Relaxed);
             c.needs_keyframe.store(true, Ordering::Relaxed);
@@ -438,6 +487,8 @@ mod tests {
         "sz,640,480",
         "kf",
         "po,1",
+        "cd,hevc444,hevc,h264",
+        "cl,test",
     ];
 
     /// Sends every command to a server that has input, a microphone and resizing wired

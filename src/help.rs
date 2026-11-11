@@ -35,6 +35,14 @@ Video:
   --paintover-crf, --paintover-burst, --paintover-delay-ms
                                 sharpening once the screen goes still
                                 (default 16, 3, 150)
+  --hevc                        macOS: offer HEVC and HEVC 4:4:4 (hardware) to
+                                clients that ask with cd,<codec>; the web client
+                                stays on H.264 (default true)
+  --virtual-display             macOS: let a client ask for a virtual display of
+                                its own size (vd,W,H,scale), streamed instead of
+                                the real screen, removed when it disconnects
+                                (experimental; on a headless Mac it replaces
+                                the only display for every viewer; default false)
   --stripes                     encode the screen as N independent streams
                                 (experimental, default 1)
   --convert-threads, --coalesce-us

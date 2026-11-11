@@ -223,12 +223,23 @@ apps that should hear you.
 | `--capture-scale`      | native, within the budget   | streamed pixels per point                                                              |
 | `--output-size`        | none                        | stream at most WxH pixels (e.g. `1366x768`) by picking the capture scale                |
 | `--encoder`            | `videotoolbox`              | H.264 encoder: `videotoolbox` (hardware; falls back to x264) or `x264`                 |
+| `--hevc`               | `true`                      | also offer hardware HEVC and HEVC 4:4:4 to native clients that ask (`cd,hevc444,hevc,h264`) |
+| `--virtual-display`    | `false`                     | experimental: let a client ask for a virtual display of its own size (`vd,W,H,scale`)  |
 | `--max-capture-pixels` | `4096000` (2560x1600)       | pixel budget for the automatic scale: x264's cost grows with area                      |
 | `--microphone-device`  | first loopback device found | output device (name or prefix) to play the browser microphone into                     |
 | `--resize-scale`       | the capture scale           | so a viewer's window maps to the same number of points on the Mac                      |
 
 The other flags work as on Linux; `--audio-device-name`, `--microphone-fifo` and the
 rounded-corner flags don't apply.
+
+With the VideoToolbox encoder and one stripe, ScreenCaptureKit's frames go straight to
+the encoder (no CPU colour conversion: about 30% less server CPU at 1080p). Browsers
+always get H.264. A native client can send `cd,<codecs>` (first supported wins; the
+server answers `{"t":"codec","c":...}`); while a `hevc444` client is connected the
+screen is captured in 4:4:4 so coloured text keeps full chroma (at 1080p in our test:
+PSNR 34.8 dB vs 25.6 dB for H.264 4:2:0, at about a fifth of the bitrate while
+scrolling). `--virtual-display` is off by default: on a Mac with no monitor, the
+virtual display replaces the only display for every voxl instance and viewer.
 
 ### Windows
 

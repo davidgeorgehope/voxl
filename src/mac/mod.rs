@@ -17,6 +17,7 @@ pub mod input;
 pub mod mic;
 pub mod screen;
 pub mod stream;
+pub mod vdisplay;
 
 use ffi::*;
 use parking_lot::Mutex;
@@ -44,6 +45,8 @@ pub static GEOMETRY: Mutex<Option<Geometry>> = Mutex::new(None);
 
 struct Settings {
     display: u32,
+    /// Virtual display being captured instead: (id, width, height) in pixels.
+    virt: Option<(u32, u32, u32)>,
     /// Fixed pixels per point (--capture-scale), or None for automatic.
     scale: Option<f64>,
     max_pixels: f64,
@@ -52,6 +55,7 @@ struct Settings {
 
 static SETTINGS: Mutex<Settings> = Mutex::new(Settings {
     display: 0,
+    virt: None,
     scale: None,
     max_pixels: 2560.0 * 1600.0,
     fps: 60,
@@ -141,7 +145,7 @@ fn pick_display(arg: Option<&str>) -> u32 {
             }
         );
     }
-    let main = unsafe { CGMainDisplayID() };
+    let main = real_main();
     match arg.and_then(|s| s.trim_start_matches(':').parse::<u32>().ok()) {
         Some(n) if (n as usize) < ids.len() => ids[n as usize],
         Some(n) if ids.contains(&n) => n,
@@ -151,6 +155,22 @@ fn pick_display(arg: Option<&str>) -> u32 {
         }
         None => main,
     }
+}
+
+/// Vendor ID of voxl's own virtual displays ("vo").
+pub const VD_VENDOR: u32 = 0x766f;
+
+/// The main display, unless that is a voxl virtual display (another voxl's viewer):
+/// then the first real one, so instances never stream each other's virtual screens.
+pub fn real_main() -> u32 {
+    let main = unsafe { CGMainDisplayID() };
+    if unsafe { CGDisplayVendorNumber(main) } != VD_VENDOR {
+        return main;
+    }
+    active_displays()
+        .into_iter()
+        .find(|&d| unsafe { CGDisplayVendorNumber(d) } != VD_VENDOR)
+        .unwrap_or(main)
 }
 
 pub fn active_displays() -> Vec<u32> {
@@ -164,8 +184,29 @@ pub fn active_displays() -> Vec<u32> {
     v
 }
 
+/// The display to capture: the virtual one while it exists, else the chosen display,
+/// or the main display if that one went away (displays get new IDs when they are
+/// reconnected or another session reconfigures them).
 pub fn display() -> u32 {
-    SETTINGS.lock().display
+    let (d, virt) = {
+        let s = SETTINGS.lock();
+        (s.display, s.virt)
+    };
+    if let Some((id, _, _)) = virt {
+        return id;
+    }
+    if active_displays().contains(&d) {
+        return d;
+    }
+    let main = real_main();
+    log::warn!("display {d} is gone; capturing the main display {main}");
+    SETTINGS.lock().display = main;
+    main
+}
+
+/// Set by vdisplay: the virtual display to capture (None: back to the real one).
+pub fn set_virtual(v: Option<(u32, u32, u32)>) {
+    SETTINGS.lock().virt = v;
 }
 
 pub fn fps() -> u32 {
@@ -216,6 +257,12 @@ pub fn capture_scale() -> f64 {
 
 /// Streamed size of `display`.
 pub fn capture_size(display: u32) -> (u32, u32) {
+    // A virtual display streams at its own pixel size (it was made to fit the viewer).
+    if let Some((id, w, h)) = SETTINGS.lock().virt {
+        if id == display {
+            return (w, h);
+        }
+    }
     let b = unsafe { CGDisplayBounds(display) };
     size_for(b.size.width, b.size.height)
 }

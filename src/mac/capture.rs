@@ -1,5 +1,7 @@
-//! Screen capture with ScreenCaptureKit. Frames arrive as NV12 (converted on the GPU,
-//! BT.601 like the Linux path) together with the rectangles that changed, which drive
+//! Screen capture with ScreenCaptureKit. Frames arrive as NV12, or as 4:4:4 YCbCr when
+//! a client can take HEVC 4:4:4 (converted on the GPU, BT.601 like the Linux path), as
+//! IOSurface-backed pixel buffers that VideoToolbox encodes without a CPU copy
+//! (`pixbuf`). They come together with the rectangles that changed, which drive
 //! the same damage bookkeeping as XDamage: nothing is converted or encoded while the
 //! screen is still, and x264 skips the macroblocks that didn't change.
 
@@ -57,6 +59,31 @@ impl Drop for Frame {
     }
 }
 
+/// A retained capture frame handed to the encoder: VideoToolbox reads the IOSurface
+/// directly, so nothing is copied on the CPU.
+pub struct PixBuf(CVPixelBufferRef);
+unsafe impl Send for PixBuf {}
+impl PixBuf {
+    pub fn ptr(&self) -> CVPixelBufferRef {
+        self.0
+    }
+}
+impl Drop for PixBuf {
+    fn drop(&mut self) {
+        unsafe { CVPixelBufferRelease(self.0) };
+    }
+}
+
+/// '444v': 8-bit 4:4:4 bi-planar YCbCr, video range.
+pub const FMT_444: u32 = 0x3434_3476;
+
+/// Pixel format the next capture uses: NV12, or 4:4:4 while a client wants HEVC 4:4:4.
+static WANT_444: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_want_444(on: bool) {
+    WANT_444.store(on, Ordering::Relaxed);
+}
+
 /// Handed from the capture queue to the capture thread.
 #[derive(Default)]
 struct Incoming {
@@ -86,6 +113,8 @@ pub struct Capturer {
     stream: stream::Stream,
     last_check: Instant,
     rebuild: bool,
+    /// Capture pixel format (NV12 or FMT_444).
+    pub format: u32,
 }
 
 /// Number from a CFNumber value of a frame-info dictionary.
@@ -107,6 +136,11 @@ impl Capturer {
         };
         *super::GEOMETRY.lock() = Some(geometry);
         let fps = super::fps();
+        let format = if WANT_444.load(Ordering::Relaxed) {
+            FMT_444
+        } else {
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        };
         let incoming = Arc::new(Mutex::new(Incoming::default()));
         let (wake_r, wake_w) = crate::hub::wake_pipe().map_err(|e| e.to_string())?;
         let debug = std::env::var("VOXL_DEBUG_DAMAGE").is_ok();
@@ -179,7 +213,7 @@ impl Capturer {
                     flags: objc2_core_media::CMTimeFlags::Valid,
                     epoch: 0,
                 });
-                cfg.setPixelFormat(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+                cfg.setPixelFormat(format);
                 cfg.setColorMatrix(&*(kCGDisplayStreamYCbCrMatrix_ITU_R_601_4 as *const CFString));
                 // Clients draw the cursor themselves (see desktop.rs), so pointer motion
                 // costs no encode and has no stream latency.
@@ -207,6 +241,7 @@ impl Capturer {
             stream,
             last_check: Instant::now(),
             rebuild: false,
+            format,
         };
         // The stream opens with a full frame; have it before anything is converted.
         let t = Instant::now();
@@ -218,7 +253,10 @@ impl Capturer {
             log::warn!("no frame from ScreenCaptureKit yet");
         }
         me.grab(me.full())?;
-        log::info!("capturing display {display} with ScreenCaptureKit at {width}x{height}");
+        log::info!(
+            "capturing display {display} with ScreenCaptureKit at {width}x{height} ({})",
+            if format == FMT_444 { "4:4:4" } else { "4:2:0" }
+        );
         Ok(me)
     }
 
@@ -316,6 +354,18 @@ impl Capturer {
             {
                 return;
             }
+            if self.format == FMT_444 {
+                crate::convert::convert_444_band(
+                    CVPixelBufferGetBaseAddressOfPlane(pb, 0),
+                    CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
+                    CVPixelBufferGetBaseAddressOfPlane(pb, 1),
+                    CVPixelBufferGetBytesPerRowOfPlane(pb, 1),
+                    dst,
+                    y0,
+                    y1.min(self.height as usize),
+                );
+                return;
+            }
             crate::convert::convert_nv12_band(
                 CVPixelBufferGetBaseAddressOfPlane(pb, 0),
                 CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
@@ -351,6 +401,11 @@ impl Capturer {
                 CVPixelBufferGetBytesPerRowOfPlane(pb, 1),
             );
             let y = std::slice::from_raw_parts(CVPixelBufferGetBaseAddressOfPlane(pb, 0), ys * h);
+            if self.format == FMT_444 {
+                let uv = std::slice::from_raw_parts(CVPixelBufferGetBaseAddressOfPlane(pb, 1), uvs * h);
+                crate::convert::yuv444_to_bgrx(y, ys, uv, uvs, w, h, &mut out);
+                return Ok(out);
+            }
             let uv = std::slice::from_raw_parts(
                 CVPixelBufferGetBaseAddressOfPlane(pb, 1),
                 uvs * h.div_ceil(2),
@@ -360,13 +415,33 @@ impl Capturer {
         Ok(out)
     }
 
-    /// Frames are NV12 here, so the BGRX debug marker probe doesn't apply.
+    /// The current frame for the encoder to read in place (None before the first frame
+    /// or while its size doesn't match the stream).
+    pub fn pixbuf(&self) -> Option<PixBuf> {
+        let f = self.current.as_ref()?;
+        unsafe {
+            if CVPixelBufferGetWidth(f.pb) != self.width as usize
+                || CVPixelBufferGetHeight(f.pb) != self.height as usize
+            {
+                return None;
+            }
+            CVPixelBufferRetain(f.pb);
+        }
+        Some(PixBuf(f.pb))
+    }
+
+    /// A different capture format is wanted (a 4:4:4 client came or went).
+    pub fn format_stale(&self) -> bool {
+        (self.format == FMT_444) != WANT_444.load(Ordering::Relaxed)
+    }
+
+    /// Frames are YCbCr here, so the BGRX debug marker probe doesn't apply.
     pub fn bgrx(&self) -> Option<(&[u8], usize)> {
         None
     }
 
     /// The display changed or the stream ended: capture must be set up again.
     pub fn needs_rebuild(&self) -> bool {
-        self.rebuild || self.stream.stopped.load(Ordering::Relaxed)
+        self.rebuild || self.stream.stopped.load(Ordering::Relaxed) || self.format_stale()
     }
 }
