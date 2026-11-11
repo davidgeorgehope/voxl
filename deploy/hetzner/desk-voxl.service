@@ -16,7 +16,7 @@ Environment=XDG_RUNTIME_DIR=/run/desk
 Environment=LANG=C.UTF-8
 EnvironmentFile=/etc/voxl/env
 ExecStartPre=/bin/sh -c 'for i in $(seq 1 50); do [ -S /tmp/.X11-unix/X1 ] && exit 0; sleep 0.1; done; echo "Xvfb :1 did not appear"; exit 1'
-ExecStart=/usr/local/bin/voxl --addr=127.0.0.1 --port=6901 --allowed-hosts=hetzner-ash.taile209c0.ts.net --preset=ultrafast --adaptive-threads --files-root=/home/desk --file-transfers=upload,download --title=Hetzner Desktop --audio-enabled=false
+ExecStart=/usr/local/bin/voxl --addr=127.0.0.1 --port=6901 --allowed-hosts=hetzner-ash.taile209c0.ts.net --preset=ultrafast --adaptive-threads --files-root=/home/desk --file-transfers=upload,download --title=Hetzner Desktop --enable-resize --audio-enabled=false
 Restart=on-failure
 RestartSec=3
 

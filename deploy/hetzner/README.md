@@ -6,10 +6,11 @@ deployment used on `hetzner-ash` (`hetzner-ash.taile209c0.ts.net`).
 ## What runs
 
 - Systemd slice `desk.slice` with `MemoryMax=3G`
-- `desk-xvfb.service`: `Xvfb :1 -screen 0 1366x768x24 -shmem` as user `desk`
+- `desk-xvfb.service`: `Xvfb :1 -screen 0 2560x1440x24 -shmem` as user `desk`
 - `desk-session.service`: `dbus-run-session startxfce4` on `DISPLAY=:1`
 - `desk-voxl.service`: voxl on `127.0.0.1:6901`, files under `/home/desk`,
-  resize off, audio off (no PulseAudio yet)
+  `--enable-resize` on (the desktop follows the viewer's window, up to 2560×1440),
+  audio off (no PulseAudio yet). Do not enable resize on the Mac mini.
 - `tailscale serve --https=8445` proxies to that port (tailnet only).
   Port 8443 is a different service and must be left alone.
 
@@ -36,7 +37,9 @@ Firefox is the official Linux tarball in `/opt/firefox` (not the Ubuntu
 snap). `xfce4-terminal` is the terminal.
 
 Start Xvfb with `-shmem` so voxl can map the framebuffer in place
-instead of using `GetImage`.
+instead of using `GetImage`. Xvfb can only shrink from the size it started
+at, so it is started at 2560×1440: a 1080p or 1440p monitor can then be a
+1:1 desktop, and a 4K monitor is clamped to 2560×1440 and letterboxed.
 
 ## Browser
 
